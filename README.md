@@ -74,6 +74,10 @@ fumble.
 If you want to add another task, copy the shape of one of the existing
 workspaces, add tests there, and append a line to `evals/tasks.jsonl`.
 
+The agent runner requires `ANTHROPIC_API_KEY`. The framework tests run offline with `python3 -m pytest -q`.
+
 ## License
 
 MIT
+
+

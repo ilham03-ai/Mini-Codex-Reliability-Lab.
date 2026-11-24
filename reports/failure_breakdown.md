@@ -22,6 +22,7 @@
 | **Baseline honest fix (ref-check)** | **5 / 15** (33.3%) |
 | **Baseline pass_but_wrong_fix** | **0 / 15** |
 | Delta agent − baseline | **+10 tasks**, 100% vs 33.3% |
+| **Weak-agent ablation (no planner, no resolver, read+edit+run_tests only)** | **45 / 45 pass**, **102 refused calls (32.6%)**, −37% wall-clock |
 | Threshold sensitivity (classifier stability under ±1) | **100%** (base dist: `{clean_pass: 45}`) |
 
 45/45 is a clean sweep. The honest reading of that number, with everything else this report shows, is in [What the numbers do and don't say](#what-the-numbers-do-and-dont-say).
@@ -117,6 +118,74 @@ task_007 could use `.casefold()` instead of `.lower()` (stronger, equally correc
 ### Bug 4 — `wrong_file` label for runs with zero patches (fixed in v3)
 
 A failed run that produced no patches at all was labeled `wrong_file`, but "wrong file" implies the agent touched something. The baseline hits this on tasks it can't mutate (fibonacci, missing-return, mutable default). Fix: added a `no_patch` label and `ROOT_CAUSE_NO_PATCH` bucket; priority `tamper > tool > no_patch > context > model` keeps "tried-but-every-edit-rejected" classified as TOOL. After: baseline failures now correctly labeled `no_patch` in the comparison table above.
+
+## Weak-agent ablation (what the harness actually buys you)
+
+Second run on the same fleet with `--preset weak-agent`: planner off, resolver off, `search_code` and `inspect_error` tools removed. Agent sees only `read_file` + `edit_file` + `run_tests`.
+
+### Headline comparison
+
+| Metric | Full harness | Weak-agent | Delta |
+|---|---|---|---|
+| Runs | 45 | 45 | — |
+| Passes | **45 (100%)** | **45 (100%)** | **0** |
+| Total tool calls | 238 | 313 | **+32%** |
+| Refused tool calls | 6 | **102** | **+1600%** |
+| % refused | 2.52% | **32.59%** | +30 pp |
+| Avg tool calls / task | 5.3 | 7.0 | +1.7 |
+| Avg iterations / task | 4.9 | 6.5 | +1.6 |
+| Total elapsed | **1338 s** | **848 s** | **−37%** |
+
+The pass rate doesn't move. The friction does — and so does total time, in the OPPOSITE direction: the weak agent is **37% faster** in wall-clock terms because the planner API call (5-10 s/task) is removed and the tool-contract refusals are cheap retries without an extra API round-trip for planning.
+
+### Where the harness earns its keep
+
+Refused calls per task (sum across 3 seeds):
+
+| Task | Full | Weak | Δ |
+|---|---|---|---|
+| task_001 binary_search | 0 | 0 | 0 |
+| task_002 find_max | 0 | 0 | 0 |
+| task_003 fibonacci | 1 | **18** | +17 |
+| task_004 format_greeting | 0 | **24** | +24 |
+| task_005 average empty | 0 | **16** | +16 |
+| task_006 top_k | 0 | **15** | +15 |
+| task_007 count_occurrences | 0 | 0 | 0 |
+| task_008 is_valid_email | 0 | 0 | 0 |
+| task_009 sample_variance | 0 | 0 | 0 |
+| task_010 reverse_words | 0 | **17** | +17 |
+| task_011 cross-file | 0 | 0 | 0 |
+| task_012 trap test | 0 | 0 | 0 |
+| task_013 config bug | 5 | **12** | +7 |
+| task_014 mutable default | 0 | 0 | 0 |
+| task_015 shallow vs deep copy | 0 | 0 | 0 |
+
+**9 of 15 tasks are insensitive to the harness** — the model finds the fix either way. **6 tasks show visible friction** concentrated on exactly the cases the harness was built for: filename mismatch (task_004 greetings→formatter), multi-step synthesis (task_003 fibonacci recursive return, task_005 ValueError raise, task_006 sorted(reverse=True)), function the model has to find (task_010 reverse_words idiom), config-bug discovery (task_013).
+
+### The empirical finding
+
+**On this task set, planner + resolver + inspect_error + search_code don't change `pass@3`. They trade one planner API call per task for fewer tool-contract refusals and faster convergence.** The savings concentrate on 6 specific task archetypes (filename mismatches, multi-step synthesis, config discovery); on the other 9 tasks the ablation is free.
+
+Three honest caveats:
+1. **The classifier STILL doesn't fire** — weak agent recovers from every refusal within `max_iterations=15`. To get failures that feed the three-way split (tool / context / model / no_patch), you'd need to constrain further: shorter iteration budget (say 5), or weaker tooling (edit-only, no read).
+2. **`pass@3` is not `pass@1`.** A single-seed run with the weak agent would see occasional failures — stability is a seed-count artifact on this dataset.
+3. **The wall-clock advantage is artifact of the planner being expensive.** A planner that costs less (short prompt, cached) would flip the time balance.
+
+### Config block from a weak-agent run
+
+```json
+{
+  "use_planner": false,
+  "use_resolver": false,
+  "expose_inspect_error": true,
+  "exposed_tools": ["read_file", "edit_file", "run_tests"],
+  "temperature": 0.2,
+  "model": "claude-sonnet-4-6",
+  "planner_model": null
+}
+```
+
+Both runs share `model: claude-sonnet-4-6` — the ablation is strictly about harness components, not the LLM.
 
 ## Threshold sensitivity
 

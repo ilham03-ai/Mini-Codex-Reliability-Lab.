@@ -5,8 +5,11 @@ from pathlib import Path
 
 from sandbox.docker_runner import run_in_sandbox
 
-# Matches python, python3, python3.9, python3.11.2 — but not pythonX, ipython, python-foo, etc.
-_PYTHON_RE = re.compile(r"^python\d*(\.\d+)*$")
+# Matches python, python3, python3.9, python3.11.2, pypy, pypy3, pypy3.11 — but
+# not pythonX, ipython, python-foo, etc. Keeps the host's sys.executable usable
+# on non-CPython environments without widening the allowlist to arbitrary
+# scripts.
+_PYTHON_RE = re.compile(r"^(?:python|pypy)\d*(\.\d+)*$")
 
 
 def _safe_resolve(path: str, workspace: str) -> Path:
@@ -19,10 +22,37 @@ def _safe_resolve(path: str, workspace: str) -> Path:
     return candidate
 
 
+# Shell metacharacters that have no meaning once a command is tokenized with
+# shlex — because there is no shell in the loop. If the model writes them it
+# almost always means the model thinks a shell will interpret them. We refuse
+# early with a message that names the problem, so the agent fixes the next
+# call instead of handing a `2>&1` token to pytest.
+_SHELL_METACHAR_TOKENS = ("2>&1", "1>&2", ">>", "<<")
+_SHELL_METACHAR_CHARS = ("|", ";", "&", "`", "$(")
+
+
 def _sanitize_command(command: str) -> list:
     """Validate and tokenize a pytest command. Only allows pytest or <python> -m pytest."""
     if any(c in command for c in ("\n", "\r", "\x00")):
         raise ValueError("Control characters are not permitted in test commands")
+
+    # Reject shell idioms before shlex eats them. shlex.split silently consumes
+    # unmatched redirection operators and splits on whitespace, so by the time
+    # tokens reach pytest a stray `2>&1` looks like a filename. Refuse up front
+    # with an actionable message.
+    for tok in _SHELL_METACHAR_TOKENS:
+        if tok in command:
+            raise ValueError(
+                f"Shell redirection {tok!r} is not supported: the command runs "
+                f"without a shell, so redirections and pipelines have no effect. "
+                f"Drop the {tok!r} and let the tool capture stdout/stderr for you."
+            )
+    for ch in _SHELL_METACHAR_CHARS:
+        if ch in command:
+            raise ValueError(
+                f"Shell metacharacter {ch!r} is not supported: the command runs "
+                f"without a shell. Remove it and pass arguments directly."
+            )
 
     try:
         parts = shlex.split(command)
@@ -30,6 +60,15 @@ def _sanitize_command(command: str) -> list:
         raise ValueError(f"Unparseable command: {e}")
     if not parts:
         raise ValueError("Empty command")
+
+    # A leftover redirection character that survived shlex (rare — e.g. a bare
+    # ">" as its own token) is still meaningless here.
+    for p in parts:
+        if p in {">", "<", ">>", "<<", "2>", "|"}:
+            raise ValueError(
+                f"Redirection token {p!r} is not supported: the command runs "
+                f"without a shell. Remove it."
+            )
 
     executable = Path(parts[0]).name
     if executable == "pytest":
@@ -87,7 +126,18 @@ def search_code(query: str, workspace: str = ".", file_pattern: str = "*.py") ->
                         })
             except Exception:
                 pass
-        return {"success": True, "query": query, "matches": results[:50], "total": len(results)}
+        truncated = len(results) > 50
+        return {
+            "success": True,
+            "query": query,
+            "matches": results[:50],
+            "total": len(results),
+            "truncated": truncated,
+            "hint": (
+                f"only the first 50 of {len(results)} matches are shown — refine the query"
+                if truncated else None
+            ),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 

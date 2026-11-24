@@ -152,6 +152,9 @@ def _dispatch(
     return json.dumps(result, indent=2), elapsed
 
 
+MODEL = "claude-sonnet-4-6"
+
+
 def run_agent(
     issue: str,
     workspace: str,
@@ -160,31 +163,83 @@ def run_agent(
     force_docker: bool = False,
     policy: PermissionPolicy = EVAL_POLICY,
     confirm: Optional[ConfirmCallback] = None,
+    temperature: float = 0.2,
+    seed: Optional[int] = None,
+    # Ablation toggles — on by default (what the "full" harness has).
+    # Flip them off to measure each component's marginal contribution.
+    use_planner: bool = True,
+    use_resolver: bool = True,
+    expose_inspect_error: bool = True,
+    exposed_tools: Optional[list] = None,
+    model: str = MODEL,
+    planner_model: Optional[str] = None,
 ) -> dict:
-    """Run the coding agent on an issue and return metrics."""
+    """Run the coding agent on an issue and return metrics.
+
+    The ablation flags are documented in the result under `config`. A run
+    whose config differs from another is directly comparable — same model,
+    same temperature, same tasks, strictly less harness.
+    """
     # Imports are local so that framework tests (and any consumer that only uses _dispatch
     # / permission types) can import this module without the anthropic SDK installed.
     import anthropic
     from .memory import AgentMemory
     from .planner import create_plan
+    from .path_resolver import resolve_issue_paths, format_resolution_hint, empty_resolution
 
     client = anthropic.Anthropic()
     memory = AgentMemory(issue, workspace)
 
-    plan = create_plan(client, issue, workspace)
+    # --- Path resolver (ablation knob) ---
+    if use_resolver:
+        path_resolution = resolve_issue_paths(issue, workspace)
+        resolution_hint = format_resolution_hint(path_resolution)
+    else:
+        # Shape-identical empty resolution — so any downstream consumer
+        # reading `unresolved_cited` or `unresolved_inferred` doesn't
+        # KeyError in the --no-resolver run.
+        path_resolution = empty_resolution()
+        resolution_hint = ""
+
+    # --- Planner (ablation knob) ---
+    # Default the planner to the same model as the loop so --no-planner vs
+    # +planner is a clean ablation. Passing planner_model explicitly keeps
+    # the mismatch visible in the run config.
+    effective_planner_model = planner_model or model
+    if use_planner:
+        plan = create_plan(client, issue, workspace, model=effective_planner_model)
+    else:
+        plan = ""  # no plan; the model works from the issue alone
     memory.set_plan(plan)
 
     if verbose:
-        print(f"\n📋 Plan:\n{plan}\n")
+        if plan:
+            print(f"\nPlan:\n{plan}\n")
+        if resolution_hint:
+            print(f"Path resolution:\n{resolution_hint}\n")
 
-    system = f"""You are a software debugging agent. Fix bugs in Python code.
+    # Compose the system prompt. Only include sections whose knob is on.
+    system_parts = ["You are a software debugging agent. Fix bugs in Python code.", f"Issue: {issue}"]
+    if resolution_hint:
+        system_parts.append(resolution_hint)
+    if plan:
+        system_parts.append(f"Plan: {plan}")
+    system_parts.append(
+        "Read the relevant code first, then apply a targeted edit and run tests. "
+        "If they still fail, read the error and iterate. Don't declare success until "
+        "you see passing tests. Keep patches minimal — change only what's broken."
+    )
+    system = "\n\n".join(system_parts) + "\n"
 
-Issue: {issue}
-
-Plan: {plan}
-
-Read the relevant code first, then apply a targeted edit and run tests. If they still fail, read the error and iterate. Don't declare success until you see passing tests. Keep patches minimal — change only what's broken.
-"""
+    # --- Tool surface (ablation knob) ---
+    # `exposed_tools` takes precedence over the per-tool switches when set.
+    if exposed_tools is not None:
+        active_tools = [t for t in TOOLS if t["name"] in exposed_tools]
+    else:
+        active_tools = list(TOOLS)
+        if not expose_inspect_error:
+            active_tools = [t for t in active_tools if t["name"] != "inspect_error"]
+    active_tool_names = [t["name"] for t in active_tools]
 
     messages = [{"role": "user", "content": f"Fix this issue:\n\n{issue}"}]
 
@@ -192,10 +247,11 @@ Read the relevant code first, then apply a targeted edit and run tests. If they 
         memory.increment_iteration()
 
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=model,
             max_tokens=8192,
+            temperature=temperature,
             system=system,
-            tools=TOOLS,
+            tools=active_tools,
             messages=messages,
         )
 
@@ -234,7 +290,46 @@ Read the relevant code first, then apply a targeted edit and run tests. If they 
 
     # Final verification test run — pick a command that actually resolves to pytest
     # in the target environment (local vs Docker).
-    final = run_tests(_final_verification_command(force_docker), workspace, force_docker=force_docker)
+    #
+    # If the tool loop already ran pytest as its last tool call AND that run came
+    # back green, reuse that result instead of paying for another pytest run.
+    # The agent's own last run already proves "tests pass on the patched tree"
+    # inside the same sandbox we would use anyway. Only re-run when the last
+    # tool wasn't run_tests, or when it was but failed — in those cases an
+    # independent verification is cheap insurance against a flaky stop state.
+    last_test = memory.test_results[-1] if memory.test_results else None
+    last_tool_call = memory.tool_calls[-1] if memory.tool_calls else None
+    if (
+        last_test is not None
+        and last_tool_call is not None
+        and last_tool_call.name == "run_tests"
+        and last_tool_call.success
+        and last_test.get("success") is True
+    ):
+        final = dict(last_test)
+        final["reused_from_last_tool_call"] = True
+    else:
+        # Run through _dispatch so any policy (confirm, deny) applies here too.
+        cmd = _final_verification_command(force_docker)
+        output, _ = _dispatch(
+            "run_tests", {"command": cmd}, workspace,
+            policy=policy, force_docker=force_docker, confirm=confirm,
+        )
+        final = json.loads(output)
+        final["reused_from_last_tool_call"] = False
     memory.set_final_test_result(final)
 
-    return memory.to_dict()
+    out = memory.to_dict()
+    out["temperature"] = temperature
+    if seed is not None:
+        out["seed"] = seed
+    out["config"] = {
+        "use_planner": use_planner,
+        "use_resolver": use_resolver,
+        "expose_inspect_error": expose_inspect_error,
+        "exposed_tools": active_tool_names,
+        "temperature": temperature,
+        "model": model,
+        "planner_model": effective_planner_model if use_planner else None,
+    }
+    return out

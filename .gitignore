@@ -23,3 +23,8 @@ dist/
 
 results*.json
 *.log
+
+# Run artifacts under reports/ — only the markdown writeups are tracked; the
+# raw JSON (run, root_cause, sensitivity, baseline) is regenerated locally.
+reports/*.json
+!reports/latest.json

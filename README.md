@@ -25,54 +25,141 @@ python main.py \
   --verbose
 ```
 
-Batch run:
+Batch run (Docker sandbox is the default):
 
 ```bash
-python -m evals.run_eval --tasks task_001 --verbose
-python -m evals.run_eval --output results.json
+python -m evals.run_eval --output reports/run.json
 ```
 
-If you want test execution inside Docker:
+For faster iteration while developing the loop itself, drop into local mode:
 
 ```bash
-python -m evals.run_eval --isolated
+python -m evals.run_eval --local --output reports/run.json
 ```
 
-That flag copies each workspace to a temp dir and requires a reachable Docker
-daemon. The runner image is built the first time it is needed.
+`--local` runs pytest on the host Python. Use it to debug the harness, not
+to report numbers.
 
-## What Is Here
+### Multi-seed and variance
 
-- `agent/` has the loop, plan prompt, and the five tools the model can call.
-- `evals/` has the task list, the batch runner, metrics, and the toy workspaces.
-- `sandbox/` has the permission model and optional Docker runner.
-- `tests/` covers the framework code. Docker-specific checks are marked
-  `docker` and skipped unless you opt in.
+```bash
+python -m evals.run_eval --repeats 3 --temperature 0.2 --output reports/run.json
+```
 
-The agent can read files, search code, edit files, run tests, and inspect test
-output. Test execution is limited to `pytest`, and file access stays inside the
-selected workspace.
+With `--repeats > 1` each task runs N times under different seeds. The runner
+reports mean ± stddev per task. See the caveats below on what N=3 actually
+tells you.
+
+### Ablations
+
+Each component of the harness has an off switch:
+
+```bash
+python -m evals.run_eval --no-planner       # skip the planner step
+python -m evals.run_eval --no-resolver      # don't resolve filenames in the issue
+python -m evals.run_eval --no-inspect-error # hide the inspect_error tool
+python -m evals.run_eval --exposed-tools read_file,edit_file,run_tests
+python -m evals.run_eval --preset weak-agent
+```
+
+`weak-agent` is the predefined minimal configuration: same model, same
+temperature, no planner, no resolver, only `read_file` + `edit_file` +
+`run_tests`. It is the fair LLM-level baseline against the full loop.
+
+The non-LLM baseline — regex mutations over the referenced function — lives in
+`evals.naive_baseline` and runs with:
+
+```bash
+python -m evals.run_baseline --output reports/baseline.json
+```
+
+**Baseline determinism caveat.** The baseline applies mutations in a fixed
+order and stops at the first one that turns the suite green. Reordering the
+mutation list changes which task passes with which rule; the ordering in
+`evals/naive_baseline.py::_mutations_for_body` is intentional (cheap
+structural flips first, semantically-loaded refactors last) but any report
+should cite the commit SHA of the baseline it used, not just "the naive
+baseline".
+
+## What is here
+
+- `agent/` — the loop, planner, path resolver, and the five tools the model
+  can call.
+- `evals/` — tasks list, batch runner, naive baseline, metrics, the failure
+  taxonomy (coarse `classify_failure` + the three-way `classify_root_cause`
+  + reference-based `classify_against_reference`), and the toy workspaces.
+- `sandbox/` — permission policy + argv-based Docker runner.
+- `tests/` — framework coverage. Docker-specific checks are marked `docker`
+  and skipped unless you opt in with `-m docker`.
+
+The agent can read files, search code, edit files, run tests, and inspect
+test output. Test execution is limited to `pytest` with no shell semantics
+(argv only; `shlex.split`, no `shell=True`), and file access stays inside
+the selected workspace.
+
+### Instrumentation the eval adds
+
+Every run records, in addition to the usual tool counts:
+
+- **Failed tool calls, split from feedback failures.** A pytest run with red
+  tests is *not* a tool failure; pytest returning "no tests collected" or a
+  file-not-found error is. See `agent.memory.record_tool_call`.
+- **Files read before the first successful edit.** Used by the three-way
+  classifier to detect "edited without reading".
+- **Test-file modifications.** Any patch under `tests/` or on a `conftest.py`
+  is tracked separately. A "pass" that patched a test is flagged as
+  `test_tampering` and does not count as a clean success.
+- **Final file contents for reference files.** The reference check verifies
+  `must_contain` tokens against the actual post-fix file, not against the
+  `+` lines of the diff.
 
 ## Tasks
 
-There are ten little workspaces under `evals/workspaces/`. Most are one-function
-Python bugs: wrong comparisons, missing returns, missing guards, bad regexes,
-that kind of thing. The issue text for each task lives in `evals/tasks.jsonl`.
+Fifteen workspaces under `evals/workspaces/`. Each entry in `tasks.jsonl`
+carries a `source` field so bias is visible:
 
-I kept them small on purpose. If a run fails, I want it to be obvious whether
-the problem was the model, the tool loop, or the sandbox path.
+- task_001–task_010 (`author_designed`): one-function Python bugs — wrong
+  comparisons, missing returns, missing guards, bad regexes.
+- task_011 (`author_designed`): cross-file — the issue cites `discount.py`,
+  the bug is in `pricing.py`.
+- task_012 (`author_designed`): trap test — a pre-existing passing test
+  encodes the buggy behavior; the agent must update both source and test.
+- task_013 (`author_designed`): config bug — the fault is in
+  `tests/conftest.py`, not in `src/`.
+- task_014–task_015 (`pattern_from_python_docs`): two Python gotchas drawn
+  from the CPython docs (mutable default argument, shallow-vs-deep copy).
+  The function names and tests are original; the bug shape and the
+  intended fix idiom come from the cited section of the stdlib docs.
 
-## Notes
+Each task has a `reference` block declaring which files the fix should
+touch, optional `must_contain` / `must_not_contain` tokens, and a
+`forbid_test_edits` flag that turns test modifications into a failure for
+that task.
 
-I do not commit eval outputs because they depend on API credentials, model
-choice, and runtime conditions. If you want numbers, generate them locally.
+**Bias caveat.** 13 of 15 tasks are designed by the author, who knows the
+intended fix pattern in advance. The `source` field is explicit so a reader
+can weight the results. Pulling tasks from an external benchmark
+(SWE-bench-mini, documented Flask/Django bugfix commits) is future work and
+is noted in `reports/next_steps.md`.
 
-`reports/` just has a few working notes. `examples/` has two short writeups from
-real-ish runs: one easy fix that worked, one small bug the loop still managed to
-fumble.
+## What the numbers do and don't mean
 
-If you want to add another task, copy the shape of one of the existing
-workspaces, add tests there, and append a line to `evals/tasks.jsonl`.
+- **A pass rate over 1 seed is a single sample.** With `--repeats 3`, a task
+  that solves 2/3 is "two out of three", not a reliability figure; under
+  N≈10 you don't have statistics, you have examples. Report means with
+  stddev and treat anything within a seed of 100% as noise-limited.
+- **The eval only varies model sampling.** The issue text, the workspace
+  state, and the bug itself are fixed across seeds. A real reliability
+  benchmark varies the input distribution too — paraphrased issues, bug
+  variants, confounding files.
+- **The 13 workspaces are hand-crafted.** The harder ones (011–013) in
+  particular were designed knowing what pattern they test. Use them to
+  surface specific failure modes, not to claim coverage.
+
+## Reports
+
+`reports/` holds working notes and the output of a run; eval numbers are
+regenerated locally so nothing committed carries stale API costs.
 
 The agent runner requires `ANTHROPIC_API_KEY`. The framework tests run offline with `python3 -m pytest -q`.
 

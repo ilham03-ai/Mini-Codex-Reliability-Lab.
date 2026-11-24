@@ -1,12 +1,23 @@
 import anthropic
 
 
-def create_plan(client: anthropic.Anthropic, issue: str, workspace: str) -> str:
-    """Generate a step-by-step debugging plan for the given issue."""
+def create_plan(
+    client: anthropic.Anthropic,
+    issue: str,
+    workspace: str,
+    model: str = "claude-sonnet-4-6",
+) -> str:
+    """Generate a step-by-step debugging plan for the given issue.
+
+    `model` defaults to the main loop's model so --no-planner vs full compares
+    {M, plan by M} vs {M, no plan} rather than {M, plan by a stronger model} vs
+    {M, no plan}. A deliberate mismatch is still possible by passing a
+    different model name explicitly — but it must be stated in the run config
+    and reflected in the report, not hidden in a module default.
+    """
     response = client.messages.create(
-        model="claude-opus-4-7",
+        model=model,
         max_tokens=1024,
-        thinking={"type": "adaptive"},
         messages=[{
             "role": "user",
             "content": (

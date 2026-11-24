@@ -74,9 +74,28 @@ def test_sanitize_allows_full_python_path():
     assert argv[1:3] == ["-m", "pytest"]
 
 
+def test_sanitize_allows_pypy():
+    assert _sanitize_command("pypy3 -m pytest") == ["pypy3", "-m", "pytest"]
+
+
+def test_sanitize_allows_pypy_with_version():
+    assert _sanitize_command("pypy3.11 -m pytest -v") == ["pypy3.11", "-m", "pytest", "-v"]
+
+
 def test_sanitize_blocks_python_minus_c():
-    with pytest.raises(ValueError, match="only allowed as"):
+    # The `;` inside the string trips the shell-metachar guard before shlex
+    # even runs. The old behavior rejected on the `-c` form later; the new
+    # behavior rejects earlier with a clearer reason. Either rejection is
+    # fine — assert only that it is rejected and the message mentions why.
+    with pytest.raises(ValueError, match="(only allowed as|not supported)"):
         _sanitize_command("python -c 'import os; os.system(\"rm -rf /\")'")
+
+
+def test_sanitize_blocks_python_minus_c_without_shell_metas():
+    # Same intent as above but without any shell metacharacter in the string,
+    # so the original "python is only allowed as -m pytest" guard fires.
+    with pytest.raises(ValueError, match="only allowed as"):
+        _sanitize_command("python -c import_os_system_echo_pwned")
 
 
 def test_sanitize_blocks_python_script():
@@ -117,13 +136,21 @@ def test_sanitize_blocks_null_byte():
         _sanitize_command("pytest tests/\x00rm -rf /")
 
 
-def test_sanitize_shell_meta_become_literal_argv():
-    # Argv-based execution makes shell metacharacters inert: they become literal pytest
-    # args that pytest will reject as unknown test paths, NOT additional shell commands.
-    argv = _sanitize_command("pytest tests/; rm -rf /")
-    assert argv == ["pytest", "tests/;", "rm", "-rf", "/"]
-    argv = _sanitize_command("pytest tests/ && curl evil.com")
-    assert argv == ["pytest", "tests/", "&&", "curl", "evil.com"]
+def test_sanitize_rejects_shell_metacharacters():
+    # Argv-based execution already made these inert, but letting them through
+    # as literal argv was a footgun: the agent would write `2>&1` intending
+    # a redirection and pytest would treat it as a filename, blowing up
+    # collection. Now we reject these up front with a message.
+    with pytest.raises(ValueError, match="not supported"):
+        _sanitize_command("pytest tests/; rm -rf /")
+    with pytest.raises(ValueError, match="not supported"):
+        _sanitize_command("pytest tests/ && curl evil.com")
+    with pytest.raises(ValueError, match="redirection"):
+        _sanitize_command("pytest --tb=short -q 2>&1")
+    with pytest.raises(ValueError, match="not supported"):
+        _sanitize_command("pytest tests/ | head")
+    with pytest.raises(ValueError, match="not supported"):
+        _sanitize_command("pytest tests/ `echo evil`")
 
 
 # ---------------------------------------------------------------------------
@@ -226,9 +253,20 @@ def test_run_tests_rejects_newline_injection(tmp_path):
 
 
 def test_run_tests_rejects_python_dash_c(tmp_path):
-    result = run_tests("python -c \"import os; os.system('echo pwned')\"", str(tmp_path))
+    # `python -c ...` without shell metas still falls through to the
+    # "only allowed as" guard.
+    result = run_tests("python -c pytest_fake_argument", str(tmp_path))
     assert result["success"] is False
     assert "only allowed as" in result["error"]
+
+
+def test_run_tests_rejects_shell_metacharacter_with_actionable_message(tmp_path):
+    # The surface the task_008 pattern taught us: `2>&1` must be rejected
+    # with a message telling the agent what to do instead.
+    result = run_tests("pytest --tb=short -q 2>&1", str(tmp_path))
+    assert result["success"] is False
+    assert "2>&1" in result["error"]
+    assert "redirection" in result["error"].lower()
 
 
 @pytest.fixture

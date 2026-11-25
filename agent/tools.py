@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 import shlex
 import difflib
@@ -176,13 +178,23 @@ def edit_file(path: str, old_content: str, new_content: str, workspace: str = ".
         return {"success": False, "error": str(e)}
 
 
-def run_tests(command: str, workspace: str = ".", timeout: int = 60, force_docker: bool = False) -> dict:
+def run_tests(
+    command: str,
+    workspace: str = ".",
+    timeout: int = 60,
+    force_docker: bool = False,
+    container_label: str | None = None,
+) -> dict:
     try:
         argv = _sanitize_command(command)
     except ValueError as e:
         return {"success": False, "error": str(e), "command": command}
 
-    result = run_in_sandbox(workspace, argv, timeout=timeout, force_docker=force_docker)
+    result = run_in_sandbox(
+        workspace, argv,
+        timeout=timeout, force_docker=force_docker,
+        container_label=container_label,
+    )
     result["command"] = command
     return result
 

@@ -2,6 +2,8 @@
 Sandboxed test execution via Docker.
 Falls back to local subprocess when Docker is unavailable.
 """
+from __future__ import annotations
+
 import os
 import subprocess
 import tempfile
@@ -54,12 +56,18 @@ def run_in_sandbox(
     argv: list,
     timeout: int = DOCKER_TIMEOUT,
     force_docker: bool = False,
+    container_label: str | None = None,
 ) -> dict:
     """Run a tokenized argv inside a Docker container with the workspace mounted.
 
     `argv` must be a list of strings — never a single command string. Execution is
     argv-based end to end (no shell=True), which is the only real guarantee against
     command injection. When force_docker=True the local fallback is disabled.
+
+    `container_label`, when set, tags the container with `--label <label>=1`
+    so the parallel runner can target `docker kill` at the exact set of
+    containers spawned by one run, without risking killing someone else's
+    work on the same daemon. Format: free-form, usually "codex-lab-<uuid8>".
     """
     if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
         return {"success": False, "error": "argv must be a list[str]", "sandbox": "argv"}
@@ -94,8 +102,11 @@ def run_in_sandbox(
         "--user", f"{os.getuid()}:{os.getgid()}",
         "-v", f"{abs_workspace}:/workspace:rw",
         "-w", "/workspace",
-        DOCKER_RUNNER_IMAGE,
-    ] + argv
+    ]
+    if container_label:
+        docker_cmd.extend(["--label", f"{container_label}=1"])
+    docker_cmd.append(DOCKER_RUNNER_IMAGE)
+    docker_cmd += argv
 
     try:
         result = subprocess.run(
@@ -151,3 +162,31 @@ def prepare_isolated_workspace(source: str) -> str:
 
 def cleanup_workspace(path: str) -> None:
     shutil.rmtree(path, ignore_errors=True)
+
+
+def kill_containers_with_label(label: str) -> dict:
+    """Kill every running container tagged `--label <label>=1` by this harness.
+
+    Used by the parallel runner on timeout or cancellation to stop containers
+    that this run spawned, without touching anything else on the daemon.
+    Returns a dict with the ids killed and any error.
+    """
+    if not _docker_available():
+        return {"killed": [], "error": "docker not available"}
+    ids = subprocess.run(
+        ["docker", "ps", "-q", "--filter", f"label={label}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if ids.returncode != 0:
+        return {"killed": [], "error": ids.stderr.strip()}
+    container_ids = [i for i in ids.stdout.split() if i]
+    if not container_ids:
+        return {"killed": [], "error": ""}
+    killed = subprocess.run(
+        ["docker", "kill"] + container_ids,
+        capture_output=True, text=True, timeout=10,
+    )
+    return {
+        "killed": container_ids,
+        "error": killed.stderr.strip() if killed.returncode != 0 else "",
+    }

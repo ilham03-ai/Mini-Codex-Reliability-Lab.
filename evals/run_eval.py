@@ -32,6 +32,43 @@ ROOT = Path(__file__).parent.parent
 TASKS_FILE = ROOT / "evals" / "tasks.jsonl"
 
 
+def _dispatch_runs(
+    specs: list[tuple[dict, int | None]],
+    common_kwargs: dict,
+    *,
+    max_concurrency: int,
+    per_task_timeout: float | None,
+) -> tuple[list[dict], float]:
+    """Run every (task, seed) spec either sequentially (N=1) or via the
+    async parallel runner (N>1). Returns (results, wall_clock_s).
+
+    The single-worker path preserves the pre-parallel behavior bit-for-bit:
+    the same `run_task` calls happen in the same order in the same thread,
+    so the 129-test regression suite stays green.
+    """
+    import time as _time
+    if max_concurrency == 1:
+        results = []
+        t0 = _time.time()
+        for task, seed in specs:
+            results.append(run_task(task, seed=seed, **common_kwargs))
+        return results, _time.time() - t0
+
+    import asyncio
+    from evals.parallel_runner import ParallelSpec, run_parallel
+
+    pspecs = [
+        ParallelSpec(task=task, seed=seed, run_task_fn=run_task, kwargs=common_kwargs)
+        for task, seed in specs
+    ]
+    outcomes, wall_s, _label = asyncio.run(run_parallel(
+        pspecs,
+        max_concurrency=max_concurrency,
+        per_task_timeout=per_task_timeout,
+    ))
+    return [o.result for o in outcomes], wall_s
+
+
 def load_tasks(filter_ids: list[str] | None = None) -> list[dict]:
     tasks = []
     with open(TASKS_FILE) as f:
@@ -56,6 +93,8 @@ def run_task(
     exposed_tools: list | None = None,
     model: str | None = None,
     planner_model: str | None = None,
+    container_label: str | None = None,
+    cancel_event=None,
 ) -> dict:
     workspace = str(ROOT / task["workspace"])
     tmp = None
@@ -91,6 +130,10 @@ def run_task(
             agent_kwargs["model"] = model
         if planner_model is not None:
             agent_kwargs["planner_model"] = planner_model
+        if container_label is not None:
+            agent_kwargs["container_label"] = container_label
+        if cancel_event is not None:
+            agent_kwargs["cancel_event"] = cancel_event
         result = run_agent(**agent_kwargs)
         result["task_id"] = task["id"]
         result["task_title"] = task["title"]
@@ -228,6 +271,32 @@ def main() -> None:
              "model only when you want --no-planner vs full to compare "
              "{M, plan by other-M} vs {M, no plan}; the mismatch is logged.",
     )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Max concurrent (task, seed) workers. Default 1 = sequential "
+             "(preserves pre-parallel behavior). Also bounds how many Docker "
+             "containers may exist at once.",
+    )
+    parser.add_argument(
+        "--per-task-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Per-task wall-clock budget. Tasks that exceed this get "
+             "root_cause=harness_error with failure_category=timeout; any "
+             "Docker containers they spawned are killed via docker kill.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="After the main run, also measure the sequential wall-clock on "
+             "the same tasks (parallel=1) and emit a speedup ratio. Doubles "
+             "API spend; only pass this when the speedup is what you want "
+             "to report.",
+    )
     args = parser.parse_args()
 
     # Preset applies as a set of defaults; explicit flags still win.
@@ -278,23 +347,62 @@ def main() -> None:
     print(f"   Ablations: planner={use_planner} resolver={use_resolver} "
           f"inspect_error={expose_inspect_error} exposed_tools={exposed_tools or 'all'}")
 
-    results = []
-    for task in tasks:
-        for seed in range(args.repeats):
-            result = run_task(
-                task,
-                isolated=use_docker,
-                verbose=args.verbose,
-                temperature=args.temperature,
-                seed=seed if args.repeats > 1 else None,
-                use_planner=use_planner,
-                use_resolver=use_resolver,
-                expose_inspect_error=expose_inspect_error,
-                exposed_tools=exposed_tools,
-                model=args.model,
-                planner_model=args.planner_model,
+    # --- Execution ---
+    common_kwargs = dict(
+        isolated=use_docker,
+        verbose=args.verbose,
+        temperature=args.temperature,
+        use_planner=use_planner,
+        use_resolver=use_resolver,
+        expose_inspect_error=expose_inspect_error,
+        exposed_tools=exposed_tools,
+        model=args.model,
+        planner_model=args.planner_model,
+    )
+
+    def _seed_for(i: int) -> int | None:
+        return i if args.repeats > 1 else None
+
+    run_specs = [(task, _seed_for(i)) for task in tasks for i in range(args.repeats)]
+
+    wall_sequential = None
+    wall_parallel = None
+
+    print(f"\n   Concurrency: parallel={args.parallel}"
+          f"{' (sequential)' if args.parallel == 1 else ''}"
+          f"{f', per-task timeout={args.per_task_timeout}s' if args.per_task_timeout else ''}")
+
+    results, wall_s = _dispatch_runs(
+        run_specs, common_kwargs,
+        max_concurrency=args.parallel,
+        per_task_timeout=args.per_task_timeout,
+    )
+    if args.parallel == 1:
+        wall_sequential = wall_s
+    else:
+        wall_parallel = wall_s
+    print(f"\n   Wall-clock: {wall_s:.1f}s")
+
+    # Optional: measure the other mode too, for a direct speedup number.
+    if args.benchmark:
+        print(f"\n--- Benchmark: running the OTHER mode for comparison ---")
+        if args.parallel == 1:
+            # ran seq, now measure parallel at default N=4 (user can override
+            # via --parallel + --benchmark to pick their own N).
+            bench_n = 4
+            print(f"   Benchmark: parallel={bench_n}")
+            _, wall_parallel = _dispatch_runs(
+                run_specs, common_kwargs,
+                max_concurrency=bench_n,
+                per_task_timeout=args.per_task_timeout,
             )
-            results.append(result)
+        else:
+            print(f"   Benchmark: sequential")
+            _, wall_sequential = _dispatch_runs(
+                run_specs, common_kwargs,
+                max_concurrency=1,
+                per_task_timeout=args.per_task_timeout,
+            )
 
     print(f"\n{'='*60}")
     print("METRICS SUMMARY")
@@ -341,6 +449,17 @@ def main() -> None:
     sens_out = str(Path(args.output).with_name(Path(args.output).stem + "_sensitivity.json"))
     Path(sens_out).write_text(json.dumps(sens, indent=2))
     print(f"Sensitivity report saved to {sens_out}")
+
+    if wall_sequential is not None and wall_parallel is not None:
+        from evals.parallel_runner import speedup
+        sp = speedup(wall_sequential, wall_parallel)
+        print(f"\nSpeedup (sequential / parallel):")
+        print(f"  sequential wall-clock: {sp['sequential_wall_s']}s")
+        print(f"  parallel   wall-clock: {sp['parallel_wall_s']}s")
+        print(f"  speedup              : {sp['speedup']}x")
+        bench_out = str(Path(args.output).with_name(Path(args.output).stem + "_benchmark.json"))
+        Path(bench_out).write_text(json.dumps(sp, indent=2))
+        print(f"Benchmark saved to {bench_out}")
 
 
 if __name__ == "__main__":

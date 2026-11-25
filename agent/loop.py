@@ -95,6 +95,7 @@ def _dispatch(
     policy: PermissionPolicy = EVAL_POLICY,
     force_docker: bool = False,
     confirm: Optional[ConfirmCallback] = None,
+    container_label: Optional[str] = None,
 ) -> tuple[str, float]:
     perm = check_permission(policy, tool_name)
     if perm == Permission.DENY:
@@ -140,7 +141,10 @@ def _dispatch(
                 workspace,
             )
         elif tool_name == "run_tests":
-            result = run_tests(tool_input["command"], workspace, force_docker=force_docker)
+            result = run_tests(
+                tool_input["command"], workspace,
+                force_docker=force_docker, container_label=container_label,
+            )
         elif tool_name == "inspect_error":
             result = inspect_error(tool_input["log"])
         else:
@@ -173,6 +177,8 @@ def run_agent(
     exposed_tools: Optional[list] = None,
     model: str = MODEL,
     planner_model: Optional[str] = None,
+    container_label: Optional[str] = None,
+    cancel_event: Optional["threading.Event"] = None,
 ) -> dict:
     """Run the coding agent on an issue and return metrics.
 
@@ -244,6 +250,13 @@ def run_agent(
     messages = [{"role": "user", "content": f"Fix this issue:\n\n{issue}"}]
 
     for _ in range(max_iterations):
+        # Cooperative cancellation point. The parallel runner sets this event
+        # on SIGINT or on per-task timeout; the agent loop checks it before
+        # each SDK call so we don't burn API budget after cancel was signalled.
+        if cancel_event is not None and cancel_event.is_set():
+            memory.set_final_response("[cancelled]")
+            break
+
         memory.increment_iteration()
 
         response = client.messages.create(
@@ -278,6 +291,7 @@ def run_agent(
             output, elapsed = _dispatch(
                 tb.name, tb.input, workspace,
                 policy=policy, force_docker=force_docker, confirm=confirm,
+                container_label=container_label,
             )
             memory.record_tool_call(tb.name, tb.input, json.loads(output), elapsed)
             results.append({
@@ -314,6 +328,7 @@ def run_agent(
         output, _ = _dispatch(
             "run_tests", {"command": cmd}, workspace,
             policy=policy, force_docker=force_docker, confirm=confirm,
+            container_label=container_label,
         )
         final = json.loads(output)
         final["reused_from_last_tool_call"] = False

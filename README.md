@@ -50,6 +50,34 @@ With `--repeats > 1` each task runs N times under different seeds. The runner
 reports mean ± stddev per task. See the caveats below on what N=3 actually
 tells you.
 
+### Parallel execution
+
+```bash
+# Run 4 (task, seed) pairs at a time, with a 60-second per-task wall-clock budget:
+python -m evals.run_eval --parallel 4 --per-task-timeout 60 --output reports/run.json
+
+# Measure speedup vs sequential on the same fleet (doubles API spend):
+python -m evals.run_eval --parallel 4 --benchmark --output reports/run.json
+```
+
+- `--parallel N` bounds the number of concurrent `(task, seed)` workers AND
+  therefore the number of Docker containers alive at once (`asyncio.Semaphore`).
+  Default is 1 → sequential; bit-identical to the pre-parallel code path.
+- `--per-task-timeout SECONDS` fires `asyncio.wait_for`. On timeout the agent's
+  cancellation event is set so the loop exits before its next SDK call, and
+  Docker containers tagged by that run are killed via `docker kill`. The result
+  is shaped like a normal failure with `failure_category="timeout"`.
+- SIGINT (Ctrl-C) sets a global stop flag; in-flight tasks are cancelled, the
+  gather is awaited to let them return their partial outcomes, and any stray
+  labelled containers are cleaned up.
+- `--benchmark` runs the "other mode" too (sequential if you ran parallel, and
+  vice versa) and prints `speedup = sequential_s / parallel_s`.
+
+What this does NOT do: it can't forcibly kill a running agent thread mid-SDK
+call — Python threads aren't pre-emptible. Cancellation is cooperative at
+iteration boundaries. In practice the per-task timeout returns to the caller
+within a few seconds regardless; the thread exits at its next loop iteration.
+
 ### Ablations
 
 Each component of the harness has an off switch:

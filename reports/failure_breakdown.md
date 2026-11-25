@@ -168,6 +168,29 @@ This is the first time the taxonomy sees non-zero `tool_failure` on a real run. 
 
 The result is partial and marked as such in the lab artifacts. Rerunning this configuration (same flags, fresh credits) is the smallest next step to populate the three-way split with real data.
 
+## Parallel execution benchmark (on real API calls)
+
+Same 45-task fleet run end-to-end at `--parallel 4` and then sequentially
+(`--benchmark` flag) in one invocation, so the two wall-clocks are measured
+against the same tasks on the same machine within minutes of each other.
+
+| Config | Wall-clock | Speedup | Efficiency |
+|---|---|---|---|
+| Sequential | 1293.4 s (21.6 min) | 1.00× | 100 % |
+| Parallel N=4 | **354.0 s (5.9 min)** | **3.65×** | **91 %** |
+
+The 91 % efficiency means the orchestrator loses ~9 % to overhead vs an ideal
+embarrassingly-parallel speedup of 4×. Of that gap: ~6 % is API tail latency
+(the same synthetic replay shows 97 % efficiency, which is the pure
+orchestrator cost); the remaining ~3 % is Docker subprocess spawn under
+load, visible when 4 containers start within ~1 s of each other.
+
+All 45 runs passed, `fix_match=correct`, root_cause distribution
+`{clean_pass: 45}` — same shape as the sequential run. The parallel runner
+does not change pass rate, only wall-clock.
+
+Sidecar: `reports/run_parallel_benchmark.json`.
+
 ## Weak-agent ablation (what the harness actually buys you)
 
 Second run on the same fleet with `--preset weak-agent`: planner off, resolver off, `search_code` and `inspect_error` tools removed. Agent sees only `read_file` + `edit_file` + `run_tests`.

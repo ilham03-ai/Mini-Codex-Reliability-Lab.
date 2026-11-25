@@ -9,22 +9,33 @@ of the loop without dragging in a lot of unrelated code.
 
 ## At a glance
 
-- **Parallel execution with measured speedup.** 45 tasks replayed on this
-  machine with asyncio + a `Semaphore(N)` on Docker containers:
+- **Parallel execution with measured speedup, on real API calls.** 45 tasks
+  (15 bugfix workspaces × 3 seeds) run with asyncio + `Semaphore(N)` on
+  Docker containers:
 
-  | Concurrency | Wall-clock | Speedup | Efficiency |
+  | Config | Wall-clock | Speedup | Efficiency | Source |
+  |---|---|---|---|---|
+  | Sequential | 1293.4 s (21.6 min) | 1.00× | 100 % | **real Anthropic API calls** |
+  | Parallel N=4 | 354.0 s (5.9 min) | **3.65×** | **91 %** | **real Anthropic API calls** |
+
+  Both numbers measured end-to-end on the same 45-task fleet in one run with
+  `--parallel 4 --benchmark`. Raw sidecar: `reports/run_parallel_benchmark.json`
+  (gitignored; the numbers in this table are the artifact).
+
+  Synthetic cross-check — same orchestrator, same 45 task durations replayed
+  with `time.sleep` (releases the GIL like a blocking HTTP call) to isolate
+  the orchestrator overhead from API tail-latency:
+
+  | Concurrency | Synthetic wall | Speedup | Efficiency |
   |---|---|---|---|
-  | N=1 (sequential baseline) | 135.0 s | 1.00× | 100 % |
-  | N=2 | 68.9 s | **1.96×** | 98 % |
-  | N=4 | 34.9 s | **3.87×** | 97 % |
-  | N=8 | 18.6 s | **7.27×** | 91 % |
+  | N=1 | 135.0 s | 1.00× | 100 % |
+  | N=2 | 68.9 s | 1.96× | 98 % |
+  | N=4 | 34.9 s | **3.87×** | **97 %** |
+  | N=8 | 18.6 s | 7.27× | 91 % |
 
-  Durations come from `reports/run_v3.json` (real eval output) replayed with
-  `time.sleep` so the measurement doesn't spend API budget; `sleep` releases
-  the GIL like a blocking HTTP call does, so the orchestrator overhead is the
-  only variable. Reproduce with `python -m evals.benchmark_parallel`.
-  Extrapolated to the real durations (29.7 s / task avg): N=8 would cut a
-  45-task sweep from ~22 min to ~3 min.
+  The 3.65× real vs 3.87× synthetic at N=4 is the ~6 % tail-latency gap the
+  real API shows and the orchestrator-only replay doesn't. Reproduce with
+  `python -m evals.benchmark_parallel`.
 
 - **Per-task timeout and cancellation.** `asyncio.wait_for(run_task, timeout=S)`
   fires a `TimeoutError` at the caller boundary; the runner flips a

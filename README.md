@@ -7,6 +7,43 @@ This is not meant to be a serious benchmark. The workspaces are intentionally
 small so it is easy to inspect traces, reproduce mistakes, and change one piece
 of the loop without dragging in a lot of unrelated code.
 
+## At a glance
+
+- **Parallel execution with measured speedup.** 45 tasks replayed on this
+  machine with asyncio + a `Semaphore(N)` on Docker containers:
+
+  | Concurrency | Wall-clock | Speedup | Efficiency |
+  |---|---|---|---|
+  | N=1 (sequential baseline) | 135.0 s | 1.00× | 100 % |
+  | N=2 | 68.9 s | **1.96×** | 98 % |
+  | N=4 | 34.9 s | **3.87×** | 97 % |
+  | N=8 | 18.6 s | **7.27×** | 91 % |
+
+  Durations come from `reports/run_v3.json` (real eval output) replayed with
+  `time.sleep` so the measurement doesn't spend API budget; `sleep` releases
+  the GIL like a blocking HTTP call does, so the orchestrator overhead is the
+  only variable. Reproduce with `python -m evals.benchmark_parallel`.
+  Extrapolated to the real durations (29.7 s / task avg): N=8 would cut a
+  45-task sweep from ~22 min to ~3 min.
+
+- **Per-task timeout and cancellation.** `asyncio.wait_for(run_task, timeout=S)`
+  fires a `TimeoutError` at the caller boundary; the runner flips a
+  `threading.Event` the agent loop checks before each SDK call (cooperative
+  cancellation, since Python can't pre-empt a running thread), and kills any
+  Docker container tagged by this run via
+  `docker kill --filter label=<run-uuid>`. SIGINT does the same for every
+  in-flight task at once. The cancelled run returns a shaped-like-the-others
+  dict with `failure_category="timeout"`, which the classifier maps to
+  `root_cause="harness_error"` so it never pollutes the model-failure bucket.
+
+- **138 framework tests** green under `pytest -W error`, including 9 that
+  pin the parallel runner's contract: semaphore bound, wall-clock-shorter-
+  than-sum, cancel-event-reaches-thread, unique-container-label per run.
+
+- **Five classifier bugs self-caught across the day** are the real empirical
+  result — the taxonomy kept flagging edge cases in itself. Full writeup in
+  [reports/failure_breakdown.md](reports/failure_breakdown.md).
+
 ## Running
 
 ```bash

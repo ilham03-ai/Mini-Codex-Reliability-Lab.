@@ -99,7 +99,7 @@ The naive non-LLM baseline (`evals.naive_baseline`) applies regex mutations to t
 
 Delta: **+10 tasks (+66.7 pp)** over the honest baseline. **`pass_but_wrong_fix = 0`** — every mutation that turned the suite green also hit the reference. In other words, for this task set the baseline's pytest-green runs are all genuinely correct (within the reference's token checks); the baseline's limit is *coverage*, not *honesty*.
 
-## Four self-caught classifier bugs across the day
+## Five self-caught classifier bugs across the day
 
 Every one of these was in my own code. Each got a fix and a locked regression test.
 
@@ -118,6 +118,55 @@ task_007 could use `.casefold()` instead of `.lower()` (stronger, equally correc
 ### Bug 4 — `wrong_file` label for runs with zero patches (fixed in v3)
 
 A failed run that produced no patches at all was labeled `wrong_file`, but "wrong file" implies the agent touched something. The baseline hits this on tasks it can't mutate (fibonacci, missing-return, mutable default). Fix: added a `no_patch` label and `ROOT_CAUSE_NO_PATCH` bucket; priority `tamper > tool > no_patch > context > model` keeps "tried-but-every-edit-rejected" classified as TOOL. After: baseline failures now correctly labeled `no_patch` in the comparison table above.
+
+### Bug 5 — API/harness errors masqueraded as `no_patch` (fixed after the blind run)
+
+The blind-agent run died halfway through on an API credit error. `run_task`'s exception handler produced results with `patches=0, total_tool_calls=0, error="..."`. The classifier saw `patches=0` and labeled them `no_patch`, inflating that bucket with 39 harness errors. Fix: added `ROOT_CAUSE_HARNESS_ERROR` with second-highest priority (right after tampering). After: `{clean_pass: 4, tool_failure: 2, harness_error: 39}` — the shape that actually reflects what happened. Three regression tests lock the new label, including a priority check against a run with 99 refused tool calls but an exception flag.
+
+## Blind-agent partial run (first look at the classifier firing)
+
+Third run: `--no-planner --no-resolver --exposed-tools edit_file,run_tests`. The agent can edit and run tests but **cannot read any file** — it must fix blindly from the issue text alone.
+
+**The API credit ran out after task_002**, so only **6 of 45 runs** completed. That is enough to show the classifier finally firing on real failures (rather than being an unexercised 5-bucket machine).
+
+### The 6 runs that executed
+
+| Task | Seed | Iters | Tool calls | Refused | Patches | Pass | root_cause |
+|---|---|---|---|---|---|---|---|
+| task_001 binary_search | 0 | 6 | 6 | 3 | 1 | ✓ | clean_pass |
+| task_001 binary_search | 1 | 9 | 9 | 3 | 2 | ✓ | clean_pass |
+| task_001 binary_search | 2 | 10 | 10 | 5 | 1 | ✓ | clean_pass |
+| task_002 find_max | 0 | 15 | 16 | 12 | 0 | ✗ | **tool_failure** |
+| task_002 find_max | 1 | 15 | 16 | 9 | 0 | ✓ | clean_pass (recovered within budget) |
+| task_002 find_max | 2 | 15 | 16 | 13 | 0 | ✗ | **tool_failure** |
+
+**The classifier FIRES.** task_002 seeds 0 and 2 maxed out iterations with 12-13 refused edit_file calls each (all `old_content not found` — the agent was guessing the body wrong), landed 0 successful patches, and were classified `tool_failure` by the strict threshold rule.
+
+### The 5th self-caught classifier bug
+
+The 39 runs that died on API credit errors were initially classified as `no_patch` (because `patches=0`). But they aren't — they're harness-level failures, the agent never ran. Fixed by adding `ROOT_CAUSE_HARNESS_ERROR`:
+
+```python
+if result.get("error") or result.get("failure_category") == "exception":
+    return ROOT_CAUSE_HARNESS_ERROR
+```
+
+New priority: `tamper > harness_error > tool > no_patch > context > model`. Three regression tests lock the new label, including priority against a run with 99 refused tool calls but an exception flag (which must still be labeled HARNESS_ERROR, since the loop was aborted).
+
+After the fix, the blind run's label distribution is:
+```
+{clean_pass: 4, tool_failure: 2, harness_error: 39}
+```
+
+This is the first time the taxonomy sees non-zero `tool_failure` on a real run. It also closes the last known mislabeling path — see [Four self-caught classifier bugs](#four-self-caught-classifier-bugs-across-the-day), which now reads five.
+
+### Honest empirical content of this partial run
+
+- On **task_001** (binary_search, strip the stray `-1` from `return mid - 1`) the blind agent is good enough at guessing to pass **3/3** even without reading the file, taking 3-5 refused edits to find the exact body.
+- On **task_002** (flip `if x < m` to `if x > m` in find_max) the blind agent is **unreliable: 1/3 pass rate**, both failures showing the tool_failure fingerprint (12-13 refusals, 15 iters hit).
+- The other 13 tasks are **unmeasured** here — credits ran out before task_003 started.
+
+The result is partial and marked as such in the lab artifacts. Rerunning this configuration (same flags, fresh credits) is the smallest next step to populate the three-way split with real data.
 
 ## Weak-agent ablation (what the harness actually buys you)
 

@@ -6,6 +6,7 @@ from evals.failure_taxonomy import (
     ROOT_CAUSE_MODEL,
     ROOT_CAUSE_TAMPER,
     ROOT_CAUSE_NO_PATCH,
+    ROOT_CAUSE_HARNESS_ERROR,
 )
 
 
@@ -120,6 +121,48 @@ def test_zero_patches_with_edit_rejections_still_tool():
         read_before_first_edit=[],
     )
     assert classify_root_cause(r) == ROOT_CAUSE_TOOL
+
+
+def test_api_exception_is_harness_error_not_no_patch():
+    """A run that crashed before executing (API error, credit exhaustion,
+    harness exception) has patches=0 AND tool_calls=0 AND an `error` field
+    populated. The classifier must NOT confuse this with 'the agent chose
+    not to patch' — harness errors are their own bucket."""
+    r = _result(
+        final_test_passed=False,
+        patches_applied=0,
+        total_tool_calls=0,
+        failed_tool_calls=0,
+        failed_tool_breakdown={},
+        first_edit_file="",
+        read_before_first_edit=[],
+        failure_category="exception",
+        error="Error code: 400 - credit balance too low",
+    )
+    assert classify_root_cause(r) == ROOT_CAUSE_HARNESS_ERROR
+
+
+def test_harness_error_detected_via_error_field_alone():
+    r = _result(
+        final_test_passed=False,
+        patches_applied=0,
+        total_tool_calls=0,
+        error="some other exception during setup",
+    )
+    assert classify_root_cause(r) == ROOT_CAUSE_HARNESS_ERROR
+
+
+def test_harness_error_priority_above_tool_failure():
+    """Even if a run has many refused tool calls, if the error field is set
+    the classifier labels it HARNESS_ERROR (the tool-call count is incidental
+    to a run that was aborted)."""
+    r = _result(
+        final_test_passed=False,
+        failed_tool_calls=99,
+        failed_tool_breakdown={"edit_file": 99},
+        error="exception mid-run",
+    )
+    assert classify_root_cause(r) == ROOT_CAUSE_HARNESS_ERROR
 
 
 def test_pass_with_test_modification_is_tampering():

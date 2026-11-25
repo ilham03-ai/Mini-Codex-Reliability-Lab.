@@ -125,6 +125,13 @@ ROOT_CAUSE_TAMPER = "test_tampering"
 # an equivalent, so no_patch runs collapsed into TOOL/CONTEXT/MODEL based on
 # incidental fingerprints (iters count, read-before-edit). Now explicit.
 ROOT_CAUSE_NO_PATCH = "no_patch"
+# A run that didn't execute at all — the harness itself failed (API error,
+# credit exhaustion, network, crash before any tool call). Distinct from
+# NO_PATCH ("agent emitted nothing") because the agent never got to think.
+# Caught by the "error" field on the result dict that run_task populates
+# in its exception handler. Without this bucket, every harness crash
+# masquerades as a no_patch and inflates that count.
+ROOT_CAUSE_HARNESS_ERROR = "harness_error"
 
 # Canonical list of fix_match labels, public for consumers that want to assert
 # membership without duplicating the set.
@@ -173,6 +180,7 @@ ROOT_CAUSE_DESCRIPTIONS = {
     ROOT_CAUSE_MODEL: "Tools and context were fine; the patch itself was logically wrong",
     ROOT_CAUSE_TAMPER: "Agent 'passed' by editing the test suite instead of fixing the source",
     ROOT_CAUSE_NO_PATCH: "Agent (or baseline) produced zero patches — nothing was edited",
+    ROOT_CAUSE_HARNESS_ERROR: "Run died before the agent could work (API error, credit exhaustion, exception in the harness itself)",
 }
 
 # Threshold: how many failed tool calls count as a "tool-dominated" run.
@@ -207,6 +215,14 @@ def classify_root_cause(result: dict, reference: dict | None = None) -> str | No
 
     if result.get("final_test_passed"):
         return None
+
+    # Harness/API/credit error: the agent never got to work. Distinct from
+    # NO_PATCH ("agent chose not to edit"). Detected via the `error` field
+    # or the explicit "exception" failure_category that run_task's catch
+    # branch stamps on the result. Priority: above everything else because
+    # the other buckets would be meaningless on a run that never executed.
+    if result.get("error") or result.get("failure_category") == "exception":
+        return ROOT_CAUSE_HARNESS_ERROR
 
     failed_calls = int(result.get("failed_tool_calls", 0))
     tool_calls = int(result.get("total_tool_calls", 0))
@@ -416,6 +432,8 @@ def classify_root_cause_with_thresholds(
         return ROOT_CAUSE_TAMPER
     if result.get("final_test_passed"):
         return None
+    if result.get("error") or result.get("failure_category") == "exception":
+        return ROOT_CAUSE_HARNESS_ERROR
     failed_calls = int(result.get("failed_tool_calls", 0))
     tool_calls = int(result.get("total_tool_calls", 0))
     files_read = result.get("files_read") or []
@@ -512,6 +530,7 @@ def build_root_cause_report(results: list[dict], tasks_by_id: dict | None = None
         ROOT_CAUSE_MODEL: [],
         ROOT_CAUSE_TAMPER: [],
         ROOT_CAUSE_NO_PATCH: [],
+        ROOT_CAUSE_HARNESS_ERROR: [],
     }
     solved_clean = 0
     per_task = []
